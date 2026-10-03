@@ -1,6 +1,7 @@
 ext {
     extName = 'Tokianime18'
     extClass = '.Tokianime18'
+    libVersion = 16
     extVersionCode = 1
     isNsfw = true
 }

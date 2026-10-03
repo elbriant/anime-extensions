@@ -3,16 +3,20 @@ package eu.kanade.tachiyomi.animeextension.es.tokianime18
 import android.util.Log
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
+import eu.kanade.tachiyomi.animesource.model.Hoster.Companion.toHosterList
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.network.get
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.useAsJsoup
 import kotlinx.serialization.json.JsonObject
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -29,43 +33,20 @@ class Tokianime18 : AnimeHttpSource() {
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request {
-        val url = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
-            .addQueryParameter("adult", "1")
-            .addQueryParameter("pageSize", PAGE_SIZE.toString())
-            .addQueryParameter("page", (page - 1).toString())
-            .addQueryParameter("sort", "trending")
-            .build()
-        return GET(url, headers)
-    }
+    override suspend fun getPopularAnime(page: Int): AnimesPage = fetchCatalog(
+        catalogUrl(page).addQueryParameter("sort", "trending").build(),
+    )
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
-        val data = response.parseAs<CatalogResponse>()
-        val animes = data.items.map { it.toSAnime() }
-        return AnimesPage(animes, data.items.size == PAGE_SIZE)
-    }
+    // =============================== Latest ===============================
 
-    // ============================== Latest ===============================
-
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
-            .addQueryParameter("adult", "1")
-            .addQueryParameter("pageSize", PAGE_SIZE.toString())
-            .addQueryParameter("page", (page - 1).toString())
-            .addQueryParameter("sort", "rated")
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = fetchCatalog(
+        catalogUrl(page).addQueryParameter("sort", "rated").build(),
+    )
 
     // ============================== Search ===============================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val url = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
-            .addQueryParameter("adult", "1")
-            .addQueryParameter("pageSize", PAGE_SIZE.toString())
-            .addQueryParameter("page", (page - 1).toString())
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val url = catalogUrl(page)
 
         if (query.isNotEmpty()) {
             url.addQueryParameter("q", query)
@@ -84,10 +65,19 @@ class Tokianime18 : AnimeHttpSource() {
             }
         }
 
-        return GET(url.build(), headers)
+        return fetchCatalog(url.build())
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
+    private fun catalogUrl(page: Int): HttpUrl.Builder = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
+        .addQueryParameter("adult", ADULT)
+        .addQueryParameter("pageSize", PAGE_SIZE.toString())
+        .addQueryParameter("page", (page - 1).toString())
+
+    private suspend fun fetchCatalog(url: HttpUrl): AnimesPage {
+        val data = client.get(url).parseAs<CatalogResponse>()
+        val animes = data.items.map { it.toSAnime() }
+        return AnimesPage(animes, data.items.size == PAGE_SIZE)
+    }
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         AudioFilter(),
@@ -96,6 +86,53 @@ class Tokianime18 : AnimeHttpSource() {
     )
 
     // ============================== Details ===============================
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        val slug = anime.url.trimStart('/').removePrefix("anime/")
+
+        val apiUrl = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
+            .addQueryParameter("adult", ADULT)
+            .addQueryParameter("pageSize", "1")
+            .addQueryParameter("q", slug)
+            .build()
+        val data = client.get(apiUrl).parseAs<CatalogResponse>()
+        val found = data.items.firstOrNull { it.slug == slug }
+
+        return found?.toSAnime() ?: anime
+    }
+
+    override fun animeDetailsParse(response: Response): SAnime {
+        val doc = response.asJsoup()
+        val slug = response.request.url.pathSegments.last()
+
+        val anime = try {
+            doc.extractNextJs<CatalogAnime> { element ->
+                element is JsonObject && "slug" in element && "title" in element
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "animeDetailsParse: extractNextJs failed", e)
+            null
+        }
+
+        if (anime != null) {
+            return anime.toSAnime()
+        }
+
+        val title = doc.select("meta[property=og:title]").attr("content")
+            .removeSuffix(" Sub Español Online HD")
+            .removeSuffix(" Sub Online HD")
+            .ifEmpty { slug }
+        val description = doc.select("meta[property=og:description]").attr("content")
+        val image = doc.select("meta[property=og:image]").attr("content")
+
+        return SAnime.create().apply {
+            this.url = "/anime/$slug"
+            this.title = title
+            this.thumbnail_url = image
+            this.description = description
+            this.initialized = true
+        }
+    }
 
     override fun relatedAnimeListParse(response: Response): List<SAnime> {
         val doc = response.asJsoup()
@@ -147,64 +184,13 @@ class Tokianime18 : AnimeHttpSource() {
         return title.trim()
     }
 
-    override fun animeDetailsParse(response: Response): SAnime {
-        val doc = response.asJsoup()
-        val slug = response.request.url.pathSegments.last()
-
-        val anime = try {
-            doc.extractNextJs<CatalogAnime> { element ->
-                element is JsonObject && "slug" in element && "title" in element
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "animeDetailsParse: extractNextJs failed", e)
-            null
-        }
-
-        if (anime != null) {
-            return anime.toSAnime()
-        }
-
-        val title = doc.select("meta[property=og:title]").attr("content")
-            .removeSuffix(" Sub Español Online HD")
-            .removeSuffix(" Sub Online HD")
-            .ifEmpty { slug }
-        val description = doc.select("meta[property=og:description]").attr("content")
-        val image = doc.select("meta[property=og:image]").attr("content")
-
-        return SAnime.create().apply {
-            this.url = "/anime/$slug"
-            this.title = title
-            this.thumbnail_url = image
-            this.description = description
-            this.initialized = true
-        }
-    }
-
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val slug = anime.url.trimStart('/').removePrefix("anime/")
-
-        val apiUrl = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
-            .addQueryParameter("adult", "1")
-            .addQueryParameter("pageSize", "1")
-            .addQueryParameter("q", slug)
-            .build()
-        val apiResponse = client.newCall(GET(apiUrl, headers)).execute()
-        val data = apiResponse.use { it.parseAs<CatalogResponse>() }
-        val found = data.items.firstOrNull { it.slug == slug }
-
-        return found?.toSAnime() ?: anime
-    }
-
     // ============================== Episodes ===============================
-
-    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val slug = anime.url.trimStart('/').removePrefix("anime/")
 
         val seasonEntries = try {
-            val detailResponse = client.newCall(GET("$baseUrl/anime/$slug", headers)).execute()
-            val doc = detailResponse.use { it.asJsoup() }
+            val doc = client.get("$baseUrl/anime/$slug").useAsJsoup()
             doc.select("ol a[href^=/anime/]").mapNotNull { el ->
                 val href = el.attr("href")
                 val relSlug = href.removePrefix("/anime/").trim()
@@ -243,9 +229,8 @@ class Tokianime18 : AnimeHttpSource() {
         return allEpisodes.sortedByDescending { it.episode_number }
     }
 
-    private fun fetchEpisodesForSlug(slug: String): List<SEpisode> = try {
-        val response = client.newCall(GET("$baseUrl/api/anime/$slug/episodes", headers)).execute()
-        val data = response.use { it.parseAs<EpisodesResponse>() }
+    private suspend fun fetchEpisodesForSlug(slug: String): List<SEpisode> = try {
+        val data = client.get("$baseUrl/api/anime/$slug/episodes").parseAs<EpisodesResponse>()
         data.withVideo.map { epNum ->
             val meta = data.meta[epNum.toString()]
             SEpisode.create().apply {
@@ -262,15 +247,16 @@ class Tokianime18 : AnimeHttpSource() {
         emptyList()
     }
 
-    // ============================== Video ===============================
+    // ============================== Videos ===============================
 
-    override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
-
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val epUrl = if (episode.url.startsWith("http")) episode.url else "$baseUrl${episode.url}"
-        val response = client.newCall(GET(epUrl, headers)).execute()
-        return response.use { parseVideosFromWatchPage(it) }
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val watchUrl = if (episode.url.startsWith("http")) episode.url else "$baseUrl${episode.url}"
+        return client.get(watchUrl)
+            .use { parseVideosFromWatchPage(it) }
+            .toHosterList()
     }
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList.orEmpty()
 
     private fun parseVideosFromWatchPage(response: Response): List<Video> {
         val doc = response.asJsoup()
@@ -287,16 +273,14 @@ class Tokianime18 : AnimeHttpSource() {
             return parseVideosFromHtml(doc)
         }
 
-        val videos = data.rankedServers.mapNotNull { server ->
+        return data.rankedServers.mapNotNull { server ->
             val playSrc = server.play?.src ?: return@mapNotNull null
             val videoUrl = if (playSrc.startsWith("http")) playSrc else "$baseUrl$playSrc"
             Video(
-                url = videoUrl,
-                quality = "${server.lang} - ${server.quality ?: "default"}",
                 videoUrl = videoUrl,
+                videoTitle = "${server.lang} - ${server.quality ?: "default"}",
             )
         }
-        return videos
     }
 
     private fun parseVideosFromHtml(doc: org.jsoup.nodes.Document): List<Video> {
@@ -305,15 +289,37 @@ class Tokianime18 : AnimeHttpSource() {
             val playSrc = match.groupValues[4]
             val videoUrl = if (playSrc.startsWith("http")) playSrc else "$baseUrl$playSrc"
             Video(
-                url = videoUrl,
-                quality = "${match.groupValues[2]} - ${match.groupValues[3]}",
                 videoUrl = videoUrl,
+                videoTitle = "${match.groupValues[2]} - ${match.groupValues[3]}",
             )
         }.toList()
     }
 
+    // ===================== Legacy request / parse API =====================
+    // Browsing, details and episodes are fetched through the suspend functions above,
+    // so these abstract members are only implemented to satisfy the compiler.
+
+    override fun popularAnimeRequest(page: Int): Request = throw UnsupportedOperationException()
+
+    override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+
+    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
+
+    override fun latestUpdatesParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = throw UnsupportedOperationException()
+
+    override fun searchAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
+
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
+
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
+
     companion object {
         private const val TAG = "Tokianime18"
+        private const val ADULT = "1"
         private const val PAGE_SIZE = 36
 
         private val REGEX_AUDIO_PREFIX = Regex("^(?:LAT|CAST|SUB)+")
