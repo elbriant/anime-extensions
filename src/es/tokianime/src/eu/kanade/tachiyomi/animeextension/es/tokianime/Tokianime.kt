@@ -355,11 +355,16 @@ class Tokianime :
 
     /** Puts the preferred audio first and, within it, the preferred quality - the first entry is the one the app picks. */
     private fun sortVideosByPreference(videos: List<Video>): List<Video> {
-        val audio = preferences.getString(PREF_AUDIO_KEY, PREF_AUDIO_DEFAULT) ?: PREF_AUDIO_DEFAULT
+        val audio = preferences.getString(PREF_AUDIO_KEY, PREF_AUDIO_DEFAULT).orEmpty()
         val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
 
         return videos.sortedWith(
-            compareByDescending<Video> { it.videoTitle.contains(audio, ignoreCase = true) }
+            // Equality rather than contains(): everything before " - " is the whole audio tag and
+            // "SUB" must not also rank "SUB-EN"; the empty value of "Cualquiera" then matches
+            // nothing at all, so the payload order is kept.
+            compareByDescending<Video> {
+                it.videoTitle.substringBefore(" - ").equals(audio, ignoreCase = true)
+            }
                 .thenByDescending { it.videoTitle.contains(quality, ignoreCase = true) },
         ).mapIndexed { index, video -> video.copy(preferred = index == 0) }
     }
@@ -402,9 +407,13 @@ class Tokianime :
         return REGEX_SERVER_PATTERN.findAll(payload).mapNotNull { match ->
             val playSrc = match.groupValues[3]
             val videoUrl = if (playSrc.startsWith("http")) playSrc else "$baseUrl$playSrc"
+            // Same label the DTO parser builds, so both paths sort identically: `quality` is
+            // optional here because the +18 host omits the key and falls back to "default".
+            val quality = REGEX_QUALITY.find(match.groupValues[2])
+                ?.groupValues?.get(1)?.takeIf { it.isNotEmpty() }
             Video(
                 videoUrl = videoUrl,
-                videoTitle = "${match.groupValues[1]} - ${match.groupValues[2]}",
+                videoTitle = "${match.groupValues[1]} - ${quality ?: "default"}",
             )
         }.toList()
     }
@@ -501,10 +510,15 @@ class Tokianime :
         private val REGEX_YEAR_EPS = Regex("\\s*\\d{4}\\s*[•·]?\\s*\\d+\\s*eps?$")
         private val REGEX_YEAR = Regex("\\s*\\d{4}\\s*$")
 
+        /**
+         * [^{}]* cannot cross an object, so group 2 is exactly this server's own text up to
+         * "play" - [REGEX_QUALITY] reads `quality` from it, a key the +18 host never sends.
+         */
         private val REGEX_SERVER_PATTERN = Regex(
-            """"lang":\s*"([^"]+)"[^{}]*?"quality":\s*"([^"]+)"[^{}]*?""" +
-                """"play":\s*\{[^{}]*"src":\s*"([^"]+)"""",
+            """"lang":\s*"([^"]+)"([^{}]*?)"play":\s*\{[^{}]*?"src":\s*"([^"]+)"""",
         )
+
+        private val REGEX_QUALITY = Regex(""""quality":\s*(?:"([^"]+)"|null)""")
 
         private val REGEX_EPISODE_SUFFIX = Regex(""",\s*(?:episodio|cap[ií]tulo)\s+\d+$""")
 
