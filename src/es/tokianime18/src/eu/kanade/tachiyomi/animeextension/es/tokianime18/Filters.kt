@@ -8,18 +8,16 @@ class AudioFilter :
         arrayOf(
             "Todos",
             "Subtitulado",
-            "DUB-EN",
-            "DUB-ES",
-            "RAW",
-            "SUB-EN",
+            "Doblado",
+            "Español Latino",
+            "Castellano",
         ),
     ) {
     val selected get() = when (state) {
         1 -> "SUB"
-        2 -> "DUB-EN"
-        3 -> "DUB-ES"
-        4 -> "RAW"
-        5 -> "SUB-EN"
+        2 -> "DUB"
+        3 -> "LAT"
+        4 -> "CAST"
         else -> "ALL"
     }
 }
@@ -74,14 +72,14 @@ class SortFilter :
     AnimeFilter.Select<String>(
         "Ordenar",
         arrayOf(
-            "Popular",
             "Tendencia",
+            "Popular",
             "A-Z",
         ),
     ) {
     val selected get() = when (state) {
-        1 -> "trending"
+        1 -> "popular"
         2 -> "az"
-        else -> "popular"
+        else -> "trending"
     }
 }

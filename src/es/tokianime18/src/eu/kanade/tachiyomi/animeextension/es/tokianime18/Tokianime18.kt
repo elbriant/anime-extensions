@@ -15,6 +15,7 @@ import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -139,6 +140,8 @@ class Tokianime18 : AnimeHttpSource() {
         val currentSlug = response.request.url.pathSegments.last()
         val results = mutableListOf<SAnime>()
 
+        // 1. Season/OVA links from the <ol> list (aria-label="Ver episodios de X")
+        //    These are ALREADY merged into episodes, so skip them from related
         val seasonSlugs = mutableSetOf<String>()
         doc.select("ol a[href^=/anime/]").forEach { el ->
             val href = el.attr("href")
@@ -148,6 +151,7 @@ class Tokianime18 : AnimeHttpSource() {
             }
         }
 
+        // 2. Recommendation links from other sections (card-style with text/images)
         doc.select("a[href^=/anime/].anime-card-touch, a[href^=/anime/][draggable]").forEach { el ->
             val href = el.attr("href")
             val slug = href.removePrefix("/anime/").trim()
@@ -159,7 +163,8 @@ class Tokianime18 : AnimeHttpSource() {
                 val ariaLabel = el.attr("aria-label")
                 title = ariaLabel.removePrefix("Ver episodios de ").removePrefix("Ver anime de ")
             }
-            title = cleanRelatedTitle(title).ifEmpty { slug }
+            title = cleanRelatedTitle(title)
+            if (title.isEmpty()) return@forEach
 
             results.add(
                 SAnime.create().apply {
@@ -167,13 +172,12 @@ class Tokianime18 : AnimeHttpSource() {
                     this.title = title
                     thumbnail_url = imgEl?.attr("src")?.takeIf { it.startsWith("http") }
                         ?: imgEl?.attr("data-src")?.takeIf { it.startsWith("http") }
-                        ?: ""
                     initialized = false
                 },
             )
         }
 
-        return results.distinctBy { it.url }.take(15)
+        return results.distinctBy { it.url }.take(MAX_RELATED)
     }
 
     private fun cleanRelatedTitle(raw: String): String {
@@ -204,6 +208,7 @@ class Tokianime18 : AnimeHttpSource() {
                 }
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e(TAG, "getEpisodeList: failed to fetch detail page", e)
             emptyList()
         }
@@ -213,6 +218,7 @@ class Tokianime18 : AnimeHttpSource() {
                 .sortedByDescending { it.episode_number }
         }
 
+        // Merge all episodes with labels from aria-label
         val allEpisodes = mutableListOf<SEpisode>()
         var episodeOffset = 0f
 
@@ -243,18 +249,16 @@ class Tokianime18 : AnimeHttpSource() {
             }
         }
     } catch (e: Exception) {
+        if (e is CancellationException) throw e
         Log.e(TAG, "fetchEpisodes: failed for $slug", e)
         emptyList()
     }
 
     // ============================== Videos ===============================
 
-    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
-        val watchUrl = if (episode.url.startsWith("http")) episode.url else "$baseUrl${episode.url}"
-        return client.get(watchUrl)
-            .use { parseVideosFromWatchPage(it) }
-            .toHosterList()
-    }
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> = client.get("$baseUrl${episode.url}")
+        .use { parseVideosFromWatchPage(it) }
+        .toHosterList()
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList.orEmpty()
 
@@ -284,13 +288,21 @@ class Tokianime18 : AnimeHttpSource() {
     }
 
     private fun parseVideosFromHtml(doc: org.jsoup.nodes.Document): List<Video> {
+        // The payload is embedded in a Next.js flight string, where quotes and unicode are escaped.
+        // Scan from "rankedServers" onwards and unescape it before matching.
         val html = doc.html()
-        return REGEX_SERVER_PATTERN.findAll(html).mapNotNull { match ->
-            val playSrc = match.groupValues[4]
+        val payload = html.substring(html.indexOf("rankedServers").coerceAtLeast(0))
+            .replace("\\\"", "\"")
+            .replace(REGEX_UNICODE_ESCAPE) { match ->
+                match.groupValues[1].toInt(16).toChar().toString()
+            }
+
+        return REGEX_SERVER_PATTERN.findAll(payload).mapNotNull { match ->
+            val playSrc = match.groupValues[3]
             val videoUrl = if (playSrc.startsWith("http")) playSrc else "$baseUrl$playSrc"
             Video(
                 videoUrl = videoUrl,
-                videoTitle = "${match.groupValues[2]} - ${match.groupValues[3]}",
+                videoTitle = "${match.groupValues[1]} - ${match.groupValues[2]}",
             )
         }.toList()
     }
@@ -321,6 +333,7 @@ class Tokianime18 : AnimeHttpSource() {
         private const val TAG = "Tokianime18"
         private const val ADULT = "1"
         private const val PAGE_SIZE = 36
+        private const val MAX_RELATED = 15
 
         private val REGEX_AUDIO_PREFIX = Regex("^(?:LAT|CAST|SUB)+")
 
@@ -334,9 +347,10 @@ class Tokianime18 : AnimeHttpSource() {
         private val REGEX_YEAR = Regex("\\s*\\d{4}\\s*$")
 
         private val REGEX_SERVER_PATTERN = Regex(
-            """"sourceId":\s*"([^"]+)"[\s\S]*?"lang":\s*"([^"]+)"[\s\S]*?""" +
-                """"quality":\s*"([^"]+)"[\s\S]*?"play":\s*\{[^}]*"src":\s*"([^"]+)"[\s\S]*?""" +
-                """"kind":\s*"([^"]+)"""",
+            """"lang":\s*"([^"]+)"[\s\S]*?"quality":\s*"([^"]+)"[\s\S]*?""" +
+                """"play":\s*\{[^}]*"src":\s*"([^"]+)"""",
         )
+
+        private val REGEX_UNICODE_ESCAPE = Regex("""\\u([0-9a-fA-F]{4})""")
     }
 }

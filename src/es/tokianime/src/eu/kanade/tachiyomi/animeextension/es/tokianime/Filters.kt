@@ -45,14 +45,14 @@ class AudioFilter :
             "Todos",
             "Español Latino",
             "Castellano",
-            "Inglés",
+            "Doblado",
             "Subtitulado",
         ),
     ) {
     val selected get() = when (state) {
         1 -> "LAT"
         2 -> "CAST"
-        3 -> "EN"
+        3 -> "DUB"
         4 -> "SUB"
         else -> "ALL"
     }
