@@ -1,6 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.es.tokianime18
 
+import android.content.SharedPreferences
 import android.util.Log
+import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.Hoster
@@ -11,8 +14,11 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.network.get
+import keiyoushi.network.rateLimit
+import keiyoushi.utils.addListPreference
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.useAsJsoup
 import kotlinx.coroutines.CancellationException
@@ -22,7 +28,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 
-class Tokianime18 : AnimeHttpSource() {
+class Tokianime18 :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "Tokianime18"
 
@@ -32,6 +40,13 @@ class Tokianime18 : AnimeHttpSource() {
 
     override val supportsLatest = true
 
+    // The host answers 429 past roughly eight requests per second, so stay below that.
+    override val client = network.client.newBuilder()
+        .rateLimit(5) { it.host == baseUrl.toHttpUrl().host }
+        .build()
+
+    private val preferences: SharedPreferences by getPreferencesLazy()
+
     // ============================== Popular ===============================
 
     override suspend fun getPopularAnime(page: Int): AnimesPage = fetchCatalog(
@@ -40,9 +55,52 @@ class Tokianime18 : AnimeHttpSource() {
 
     // =============================== Latest ===============================
 
-    override suspend fun getLatestUpdates(page: Int): AnimesPage = fetchCatalog(
-        catalogUrl(page).addQueryParameter("sort", "rated").build(),
-    )
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        // This host exposes no recency endpoint, so past the 21 card home rail the tab
+        // continues with the catalog under "popular" - "trending" is the Populares tab.
+        if (page > 1) {
+            return fetchCatalog(catalogUrl(page - 1).addQueryParameter("sort", "popular").build())
+        }
+
+        // The home "Episodios recientes" rail is the only recency source with adult content;
+        // its cards are landscape banners, so the flight payload supplies the portrait cover.
+        val doc = client.get("$baseUrl/").useAsJsoup()
+        val covers = extractCoverMap(doc.html())
+        val animes = doc.select("#ultimos a[href^=/watch/]").mapNotNull { el ->
+            val slug = el.attr("href").removePrefix("/watch/").substringBefore('/')
+            if (slug.isEmpty()) return@mapNotNull null
+
+            val title = REGEX_EPISODE_SUFFIX.replace(el.attr("aria-label").removePrefix("Ver "), "")
+            SAnime.create().apply {
+                url = "/anime/$slug"
+                this.title = title.ifEmpty { slug }
+                thumbnail_url = covers[slug]
+                    ?: el.selectFirst("img")?.attr("src")?.takeIf { it.startsWith("http") }
+                initialized = false
+            }
+        }.distinctBy { it.url }
+
+        return AnimesPage(animes, true)
+    }
+
+    /**
+     * Slug to portrait cover for every anime in the home page's Next.js flight payload.
+     * The payload is unescaped and split on each `{"id":` opening, which keeps `slug` and
+     * `coverImage` of one anime together without leaking into a nested `creator.slug`.
+     * Empty covers are left out: the site has none for some titles.
+     */
+    private fun extractCoverMap(html: String): Map<String, String> {
+        val payload = html.replace("\\\"", "\"")
+        return payload.split(OBJECT_MARKER)
+            .drop(1) // text preceding the first object carries no data
+            .mapNotNull { chunk ->
+                val slug = REGEX_PAYLOAD_SLUG.find(chunk)?.groupValues?.get(1) ?: return@mapNotNull null
+                val cover = REGEX_PAYLOAD_COVER.find(chunk)?.groupValues?.get(1)
+                    ?.takeIf { it.startsWith("http") } ?: return@mapNotNull null
+                slug to cover
+            }
+            .toMap()
+    }
 
     // ============================== Search ===============================
 
@@ -93,13 +151,16 @@ class Tokianime18 : AnimeHttpSource() {
 
         val apiUrl = "$baseUrl/api/catalog".toHttpUrl().newBuilder()
             .addQueryParameter("adult", ADULT)
-            .addQueryParameter("pageSize", "1")
+            .addQueryParameter("pageSize", DETAIL_LOOKUP_PAGE_SIZE)
             .addQueryParameter("q", slug)
             .build()
         val data = client.get(apiUrl).parseAs<CatalogResponse>()
         val found = data.items.firstOrNull { it.slug == slug }
+        if (found != null) return found.toSAnime()
 
-        return found?.toSAnime() ?: anime
+        // The catalog search does not resolve every slug ("no-game-no-life" answers with an
+        // empty page), so fall back to the detail page whose og:image always carries a cover.
+        return client.get("$baseUrl/anime/$slug").use { animeDetailsParse(it) }
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
@@ -140,8 +201,7 @@ class Tokianime18 : AnimeHttpSource() {
         val currentSlug = response.request.url.pathSegments.last()
         val results = mutableListOf<SAnime>()
 
-        // 1. Season/OVA links from the <ol> list (aria-label="Ver episodios de X")
-        //    These are ALREADY merged into episodes, so skip them from related
+        // 1. Season/OVA links from the <ol> list - already merged into episodes, so skip them
         val seasonSlugs = mutableSetOf<String>()
         doc.select("ol a[href^=/anime/]").forEach { el ->
             val href = el.attr("href")
@@ -158,12 +218,14 @@ class Tokianime18 : AnimeHttpSource() {
             if (slug.isEmpty() || slug == currentSlug || slug in seasonSlugs) return@forEach
             val imgEl = el.selectFirst("img")
 
-            var title = el.text()
-            if (title.isEmpty()) {
-                val ariaLabel = el.attr("aria-label")
-                title = ariaLabel.removePrefix("Ver episodios de ").removePrefix("Ver anime de ")
-            }
-            title = cleanRelatedTitle(title)
+            // The title lives in its own <h3>; el.text() also drags in badges, genres and "2024 • 12 eps".
+            val title = el.selectFirst("h3")?.text()?.trim()?.takeIf { it.isNotEmpty() }
+                ?: el.attr("aria-label")
+                    .removePrefix("Ver episodios de ")
+                    .removePrefix("Ver anime de ")
+                    .trim()
+                    .takeIf { it.isNotEmpty() }
+                ?: cleanRelatedTitle(el.text())
             if (title.isEmpty()) return@forEach
 
             results.add(
@@ -180,8 +242,9 @@ class Tokianime18 : AnimeHttpSource() {
         return results.distinctBy { it.url }.take(MAX_RELATED)
     }
 
+    /** Last resort for cards exposing neither <h3> nor aria-label: strips badges, genres and the "2024 • 12 eps" line. */
     private fun cleanRelatedTitle(raw: String): String {
-        var title = REGEX_AUDIO_PREFIX.replace(raw, "")
+        var title = REGEX_BADGE_PREFIX.replace(raw, "")
         title = REGEX_GENRE_STRIP.replace(title, "")
         title = REGEX_YEAR_EPS.replace(title, "")
         title = REGEX_YEAR.replace(title, "")
@@ -214,36 +277,44 @@ class Tokianime18 : AnimeHttpSource() {
         }
 
         if (seasonEntries.isEmpty()) {
-            return fetchEpisodesForSlug(slug)
+            return fetchEpisodesForSlug(slug, mutableSetOf())
                 .sortedByDescending { it.episode_number }
         }
 
         // Merge all episodes with labels from aria-label
         val allEpisodes = mutableListOf<SEpisode>()
+        val usedTitles = mutableSetOf<String>()
         var episodeOffset = 0f
 
         for ((relSlug, label) in seasonEntries) {
-            val relEpisodes = fetchEpisodesForSlug(relSlug)
+            val relEpisodes = fetchEpisodesForSlug(relSlug, usedTitles)
+            // Read the raw maximum before the loop rewrites the numbers with the current
+            // offset - reading it afterwards would apply the offset twice per season.
+            val blockEnd = relEpisodes.maxOfOrNull { it.episode_number } ?: 0f
             relEpisodes.forEach { ep ->
                 ep.name = "$label - ${ep.name}"
                 ep.episode_number = ep.episode_number + episodeOffset
                 allEpisodes.add(ep)
             }
-            episodeOffset += relEpisodes.size.toFloat()
+            episodeOffset += blockEnd
         }
 
         return allEpisodes.sortedByDescending { it.episode_number }
     }
 
-    private suspend fun fetchEpisodesForSlug(slug: String): List<SEpisode> = try {
+    private suspend fun fetchEpisodesForSlug(slug: String, usedTitles: MutableSet<String>): List<SEpisode> = try {
         val data = client.get("$baseUrl/api/anime/$slug/episodes").parseAs<EpisodesResponse>()
         data.withVideo.map { epNum ->
-            val meta = data.meta[epNum.toString()]
+            // The API repeats the same season-2 titles for every "season-*" slug, so a title
+            // is only kept the first time it appears across the merged seasons.
+            val metaTitle = data.meta[epNum.toString()]?.title
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() && usedTitles.add(it) }
             SEpisode.create().apply {
                 url = "/watch/$slug/$epNum"
                 name = buildString {
                     append("Episodio $epNum")
-                    meta?.title?.let { append(" - $it") }
+                    metaTitle?.let { append(" - $it") }
                 }
                 episode_number = epNum.toFloat()
             }
@@ -251,7 +322,7 @@ class Tokianime18 : AnimeHttpSource() {
     } catch (e: Exception) {
         if (e is CancellationException) throw e
         Log.e(TAG, "fetchEpisodes: failed for $slug", e)
-        emptyList()
+        throw e
     }
 
     // ============================== Videos ===============================
@@ -260,7 +331,23 @@ class Tokianime18 : AnimeHttpSource() {
         .use { parseVideosFromWatchPage(it) }
         .toHosterList()
 
-    override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList.orEmpty()
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = sortVideosByPreference(hoster.videoList.orEmpty())
+
+    override fun List<Video>.sortVideos(): List<Video> = sortVideosByPreference(this)
+
+    /**
+     * Puts the preferred audio first and, within it, the preferred quality - the first entry
+     * is the one the app picks. The +18 host reports no quality yet, so half of it is a no-op.
+     */
+    private fun sortVideosByPreference(videos: List<Video>): List<Video> {
+        val audio = preferences.getString(PREF_AUDIO_KEY, PREF_AUDIO_DEFAULT) ?: PREF_AUDIO_DEFAULT
+        val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
+
+        return videos.sortedWith(
+            compareByDescending<Video> { it.videoTitle.contains(audio, ignoreCase = true) }
+                .thenByDescending { it.videoTitle.contains(quality, ignoreCase = true) },
+        ).mapIndexed { index, video -> video.copy(preferred = index == 0) }
+    }
 
     private fun parseVideosFromWatchPage(response: Response): List<Video> {
         val doc = response.asJsoup()
@@ -307,6 +394,27 @@ class Tokianime18 : AnimeHttpSource() {
         }.toList()
     }
 
+    // ============================ Preferences =============================
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addListPreference(
+            key = PREF_AUDIO_KEY,
+            title = "Audio preferido",
+            default = PREF_AUDIO_DEFAULT,
+            summary = "%s",
+            entries = PREF_AUDIO_ENTRIES,
+            entryValues = PREF_AUDIO_VALUES,
+        )
+        screen.addListPreference(
+            key = PREF_QUALITY_KEY,
+            title = "Calidad preferida",
+            default = PREF_QUALITY_DEFAULT,
+            summary = "%s",
+            entries = PREF_QUALITY_ENTRIES,
+            entryValues = PREF_QUALITY_VALUES,
+        )
+    }
+
     // ===================== Legacy request / parse API =====================
     // Browsing, details and episodes are fetched through the suspend functions above,
     // so these abstract members are only implemented to satisfy the compiler.
@@ -335,21 +443,56 @@ class Tokianime18 : AnimeHttpSource() {
         private const val PAGE_SIZE = 36
         private const val MAX_RELATED = 15
 
-        private val REGEX_AUDIO_PREFIX = Regex("^(?:LAT|CAST|SUB)+")
+        /** Catalog page size used when resolving a single slug in [getAnimeDetails]. */
+        private const val DETAIL_LOOKUP_PAGE_SIZE = "8"
+
+        /** Opening of every object in the Next.js flight payload, used to pair its fields. */
+        private const val OBJECT_MARKER = "{\"id\":"
+
+        private const val PREF_AUDIO_KEY = "preferred_audio"
+        private const val PREF_AUDIO_DEFAULT = "SUB"
+        private val PREF_AUDIO_ENTRIES = listOf(
+            "Subtitulado",
+            "Subtitulado (inglés)",
+            "Audio japonés",
+            "Español Latino",
+            "Castellano",
+            "Doblado",
+            "Cualquiera",
+        )
+        private val PREF_AUDIO_VALUES = listOf("SUB", "SUB-EN", "RAW", "LAT", "CAST", "DUB", "")
+
+        private const val PREF_QUALITY_KEY = "preferred_quality"
+        private const val PREF_QUALITY_DEFAULT = "1080p"
+        private val PREF_QUALITY_ENTRIES = listOf("1080p", "720p", "480p", "Cualquiera")
+        private val PREF_QUALITY_VALUES = listOf("1080p", "720p", "480p", "")
+
+        private val REGEX_PAYLOAD_SLUG = Regex("\"slug\":\"([^\"]+)\"")
+        private val REGEX_PAYLOAD_COVER = Regex("\"coverImage\":\"([^\"]+)\"")
+
+        /** Leading badge spans, each followed by whitespace so a title merely starting with them ("SUBaru…") is left alone. */
+        private val REGEX_BADGE_PREFIX = Regex(
+            """^\s*(?:(?:\+?18|18\+|NSFW|NC17|LAT|CAST|DUB|SUB|RAW|VOSE)(?:\s+|$))+""",
+        )
 
         private val REGEX_GENRE_STRIP = Regex(
             "\\s*(?:Acci.n|Aventura|Comedia|Drama|Fantas.a|Romance|Sci-Fi|" +
                 "Sobrenatural|Misterio|Ecchi|Terror|Suspenso|Crimen|M.sica|" +
-                "Shounen|Seinen|Shoujo|Slice of Life).*$",
+                "Shounen|Seinen|Shoujo|Slice of Life|" +
+                "Hentai|Adulto|Escolares|Ahegao|Anal|Harem|MILFs?|Yuri|Incesto|" +
+                "Orgias|Bondage|BDSM|Hardcore|Futanari|Tetonas|Sin Censura|Uncensored).*$",
+            RegexOption.IGNORE_CASE,
         )
 
         private val REGEX_YEAR_EPS = Regex("\\s*\\d{4}\\s*[•·]?\\s*\\d+\\s*eps?$")
         private val REGEX_YEAR = Regex("\\s*\\d{4}\\s*$")
 
         private val REGEX_SERVER_PATTERN = Regex(
-            """"lang":\s*"([^"]+)"[\s\S]*?"quality":\s*"([^"]+)"[\s\S]*?""" +
-                """"play":\s*\{[^}]*"src":\s*"([^"]+)"""",
+            """"lang":\s*"([^"]+)"[^{}]*?"quality":\s*"([^"]+)"[^{}]*?""" +
+                """"play":\s*\{[^{}]*"src":\s*"([^"]+)"""",
         )
+
+        private val REGEX_EPISODE_SUFFIX = Regex(""",\s*(?:episodio|cap[ií]tulo)\s+\d+$""")
 
         private val REGEX_UNICODE_ESCAPE = Regex("""\\u([0-9a-fA-F]{4})""")
     }

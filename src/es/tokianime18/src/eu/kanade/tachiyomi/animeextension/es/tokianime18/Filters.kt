@@ -73,7 +73,8 @@ class SortFilter :
         "Ordenar",
         arrayOf(
             "Tendencia",
-            "Popular",
+            // sort=popular falls back to title order on this host, it is not a popularity metric.
+            "Popular de la web",
             "A-Z",
         ),
     ) {
